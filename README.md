@@ -1,2 +1,2 @@
-# shellscript
+# Shell Script
 Linux Shell Script
