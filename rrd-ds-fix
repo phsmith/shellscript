@@ -1,0 +1,80 @@
+#!/bin/bash
+#
+# Author: Phillipe Smith <phillipe.chaves@camara.leg.br>
+# Date: 24/02/2015
+#
+# Description: Script to fix rrd erros caused by the incorrect number of DataSources.
+#
+
+[ ! $USER == 'root' ] && echo 'ERRO: Execute o script como root.' && exit 1
+
+if [[ ! $1 || $1 == '-h' ]]; then
+	echo -e "USAGE: $0 [OPTIONS] [HOST/RRD_WITH_PROBLEM.rrd]\n"
+	echo -e "OPTIONS:\n    -q\tSilently execute the commands without confirmations."
+	echo -e "    -a\tAutomatically fix all rrd ds erros captured from /var/log/messages"
+	exit 1
+fi
+
+rrdpath=$(sed -nr "s/^.conf\['rrdbase'\] = \"(.*)\";/\1/p" /etc/pnp4nagios/config.php)
+
+if [ "$1" == "-a" ]; then
+    for rrd in $(cat /var/log/messages | grep -E '(expected|extra)' | awk '/\(/ {gsub(/[\(\)]/, "", $8); print $8}' | sort | uniq)
+    do 
+        echo -e "\nRRD File: $rrd"
+        echo '----------------------------------------------------------------------------------------------------------------'
+        $0 -q $rrd
+    done
+
+    exit
+fi
+
+if [ $1 == '-q' ]; then
+	#rrdfile=${rrdpath}$2
+	rrdfile=$2
+else
+	#rrdfile=${rrdpath}$1
+	rrdfile=$1
+fi
+
+rrd_ds_num=$(rrdtool info $rrdfile | grep -o "ds\[.*\]" | uniq | wc -l)
+rrd_xml_num=$(grep -o '<DS.*>' ${rrdfile%%.rrd}.xml | wc -l)
+
+function check_exit() {
+	if [ $? -eq 0 ]; then
+	    echo '[OK]' 
+	else
+	    echo '[FALHOU]' && exit 1
+    fi
+}
+
+[ -f ${rrdfile}.chg ] && rm -rf ${rrdfile}.chg
+
+echo "DataSources in: RRD=$rrd_ds_num / XML=$rrd_xml_num"
+
+[ $rrd_ds_num -eq $rrd_xml_num ] && echo 'Nothing to do... exiting...' && exit 0
+
+echo -n 'Executing rrd_modify.pl...  '
+if [ $rrd_ds_num -lt $rrd_xml_num ]; then
+	rrd_num_diff=$(($rrd_xml_num - $rrd_ds_num))
+	sudo -u nagios /usr/libexec/pnp4nagios/rrd_modify.pl $rrdfile insert $(($rrd_ds_num + 1)),$rrd_num_diff &> /dev/null
+	check_exit
+elif [ $rrd_ds_num -gt $rrd_xml_num ]; then
+	rrd_num_diff=$(($rrd_ds_num - $rrd_xml_num))
+	sudo -u nagios /usr/libexec/pnp4nagios/rrd_modify.pl $rrdfile delete $rrd_xml_num,$rrd_num_diff &> /dev/null
+	check_exit
+fi
+
+[ "$1" != '-q' ] && read -p 'Want to verify the result? [s/n]: ' result || result='n'
+[ $result == 's' ] && rrdtool info ${rrdfile}.chg | less
+
+[ "$1" != '-q' ] && read -p 'Want to apply the modifications? [s/n]: ' apply || apply='s'
+if [ $apply == 's' ]; then
+	echo -n 'Applying corrections to the rrd...  '
+	\mv -f ${rrdfile}{.chg,} 
+	check_exit
+else	
+	echo 'Nothing was done.... exiting...'
+	\rm -rf ${rrdfile}.chg
+	exit 0
+fi
+
