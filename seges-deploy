@@ -1,0 +1,333 @@
+#!/bin/bash 
+#
+# Script deploy de configurações das aplicações da SEGES
+# 
+
+### CORES NO CONSOLE ####
+RESET="\e[0m"
+ARROW='->'
+
+if [ -z tty ]; then
+    BLACK="$RESET"
+    RED="$RESET"
+    GREEN="$RESET"
+    YELLOW="$RESET"
+    BLUE="$RESET"
+    PURPLE="$RESET"
+    CYAN="$RESET"
+    WHITE="$RESET"
+    G_ARROW="$ARROW"
+    Y_ARROW="$ARROW"
+    R_ARROW="$ARROW"
+    B_ARROW="$ARROW"
+else
+    BLACK=("\e[0;30m" "\e[1;30m")
+    RED=("\e[0;31m" "\e[1;31m")
+    GREEN=("\e[0;32m" "\e[1;32m")
+    YELLOW=("\e[0;33m" "\e[1;33m")
+    BLUE=("\e[0;34m" "\e[1;34m")
+    PURPLE=("\e[0;35m" "\e[1;35m")
+    CYAN=("\e[0;36m" "\e[1;36m")
+    WHITE=("\e[0;37m" "\e[1;37m")
+    G_ARROW="${GREEN[1]}${ARROW}${RESET}"
+    Y_ARROW="${YELLOW[1]}${ARROW}${RESET}"
+    R_ARROW="${RED[1]}${ARROW}${RESET}"
+    B_ARROW="${BLUE[1]}${ARROW}${RESET}"
+fi
+
+echo -e "$RESET"
+
+APPNAME=$(basename $0)
+PID="/tmp/${APPNAME}.pid"
+DATE=$(date +"%Y%m%d-%H:%M")
+GITDIRS="$(find ~ -name '.git' | grep -v '.*etc/check_mk/.git')"
+VERIFY=false
+
+# Vericação por outra execução do script em andamento
+if [ -f $PID ]; then
+    echo -en "${R_ARROW} O script $0 está em execução [ PID = $(cat $PID) ].\n${Y_ARROW} Aguardando finalização..." 
+
+    while [ -f $PID ]
+    do
+        echo -n "..." && sleep 2 && continue
+    done
+
+    sleep 1 && echo -e $RESET
+fi
+
+### Checando se o script já está executando ###
+trap "echo -e $RESET; rm -f $PID; exit" 1 2 3 9 15
+
+[[ ! -f $PID || -z $(cat $PID) ]] && echo $$ > $PID 
+
+# Função de ajuda de utilização do script
+function help() {
+
+echo -e "USO: $0 [ OPTIONS ]
+
+OPTIONS:
+    -h|--help\t\t\t Ajuda para utilização do script
+    -H|--host\t\t\t Host onde executar as operações
+    -d|--deploy [FOLDER(s)]\t Gera os arquivos de configurações do Nagios (obs.: usar esta por último)
+    -u|--update [FOLDER(s)]\t Atualização dos diretórios versionados
+    -v|--verify\t\t\t Habilita a verificação (DIFF) das alterações ocorridas
+    -y|--noconfirm\t\t Bypass all questions 
+    -m|--message\t\t Deploy commit message. Needed by -y|--noconfirm.
+    -p|--prod\t\t\t Executa os comandos deste script remotamente na máquina de produção
+    -I [HOST(s)]\t\t Inventário de hosts
+    -II [HOST(s)]\t\t Inventário de hosts
+    -O \t\t\t\t Reload das configurações do Nagios
+    --start [SERVICE]\t\t Iniciar serviços do OMD
+    --stop [SERVICE]\t\t Parar serviços do OMD
+    --restart [SERVICE]\t\t Reiniciar serviços do OMD
+    --reload [SERVICE]\t\t Recarrega as configurações do Nagios/Check_MK
+
+EXAMPLES:
+    $APPNAME -v -d ~/etc/check_mk\t(ou somente seges-deploy -d)
+    $APPNAME -y -m 'Mensagem de Commit' -d "etc/check_mk/conf.d/services.mk local/bin/seges-deploy"
+    $APPNAME -u ~/etc/nagios\t(ou somente seges-deploy -u)
+    $APPNAME --restart 'nagios apache'\t(ou somente seges-deploy --restart)
+    $APPNAME -p -II MAREA FOCUS SONIC -O
+    $APPNAME -p -u
+"
+
+rm -f $PID && exit 1
+}
+
+function check_changes() {
+    [[ -n "$1" && ! "$1" =~ ^- ]] && _gitdirs="$@" || _gitdirs="$GITDIRS"
+    
+    # Se o arquivo não tiver sido alterado nos últimos 2 dias, o comando para atualizá-lo será executado
+    if [ $(( ($(date +%s) - $(stat -c %Y ~/etc/check_mk/conf.d/parents.mk)) / 86400 )) -gt 2 ]; then 
+        echo -e "${GREEN[0]}>>> Atualizando parents.mk...$RESET" 
+        $OMD_ROOT/local/bin/cmkparents
+    fi
+
+    echo -e "${YELLOW[0]}>>> Checando alterações nos diretórios versionados...$RESET" 
+    
+    for dir in $_gitdirs
+    do
+        unset answer_add answer_check answer_commit message 
+
+        folder=${dir%%.git}
+
+        [[ $folder =~ ^\~ ]] && folder=${folder/\~/$OMD_ROOT}
+
+        if [ -d $folder ]; then
+            cd $folder
+            type='Diretório'
+            _file='.'
+        else
+            cd $(dirname $folder)
+            type='Arquivo'
+            _file=$(basename $folder)
+        fi
+        
+        export folder
+
+        echo '-----------------------------------------------------------------------------------------'
+        echo -e "$G_ARROW ${type}: ${folder}..." 
+
+        status=$(git status -s $_file 2> /dev/null)
+        if [ $? -eq 0 ]; then
+            if [ -n "$status" ]; then
+                answer_add='s'
+                answer_check='s'
+                answer_commit='s'
+
+                [[ -n $_file && "$status" =~ "$_file" ]] && status=$(echo -e "$status\n" | grep $_file)
+                
+                echo -e "$status\n"
+
+                if [[ "$status" =~ "??" ]]; then
+                    if [ ! $NOCONFIRM ]; then
+                        echo -en "$Y_ARROW Encontrados arquivos não versionados (??)... Versioná-los agora? [s/n]: "
+                        read answer_add
+                    fi
+                    [[ $answer_add =~ [sS] ]] && (git add .; echo)
+                fi
+                
+                if [ $VERIFY = true ]; then
+                    if [ ! $NOCONFIRM ]; then
+                        echo -en "$Y_ARROW Encontradas alterações sem commmit... Verificá-las agora? [s/n]: "
+                        read answer_check
+                    fi
+                    [[ "$answer_check" =~ [sS] ]] && (git diff || git diff --cached; echo)
+                fi
+
+                if [ ! $NOCONFIRM ];then
+                    echo -en "$G_ARROW Efetuar commit no ambiente de homologacao? [s/n]: "
+                    read answer_commit
+                fi
+
+                if [[ "$answer_commit" =~ [sS] ]]; then
+                    message="$DEPLOY_MESSAGE"
+
+                    while [ -z "$message" ]; do
+                        if [ ! $NOCONFIRM ]; then
+                            echo -en "$G_ARROW Digite uma mensagem de descrição para commit: "
+                            read message
+                        else
+                            echo -en "$R_ARROW ERRO: necessário utilizar a opção: ... -m 'mensagem de commit' quando utilizar -y ou --noconfirm."
+                        fi
+                    done
+                    git commit -m "$message" $_file && git push origin master:homologacao
+                fi
+            else
+                echo -e "$G_ARROW Nenhuma alteração encontrada!"
+            fi
+        else
+            echo -e "$Y_ARROW o diretório não está versionado...\n"
+            continue
+        fi        
+        echo
+    done
+}
+
+function update() {
+    [[ -n "$1" && ! "$1" =~ ^- ]] && _gitdirs="$@" || _gitdirs="$GITDIRS"
+        
+    echo -e "${YELLOW[0]}>>> Atualizando diretórios versionados...$RESET"
+
+    for dir in $_gitdirs
+    do
+        folder=${dir%%.git}
+        
+        [[ $folder =~ ^\~ ]] && folder=${folder/\~/$OMD_ROOT}
+        
+        cd $folder
+        
+        echo '-------------------------------------------------------------------'
+        echo -e "$G_ARROW Diretório: ${folder}..." 
+        [ "${HOSTNAME%%.*}" == 'marea' ] && git checkout -- .
+        git pull
+    done
+}
+
+
+# Função que efetua o deploy das alterações no ambiente
+function deploy() {
+    [[ -n "$1" && ! "$1" =~ ^- ]] && _gitdir="$@" || _gitdir="$(find ~ -name '.git' | grep -v '.*etc/check_mk/.git')"
+    
+    # Checagem por alterações nos diretórios versionados
+    check_changes "$_gitdir"
+
+    echo -e "\n${YELLOW[0]}>>> Verficando diferenças entre o repositório de produção e homologacao...$RESET" 
+
+    for dir in $folder
+    do
+        unset answer_check answer_commit
+
+        [ -f $dir ] && folder=$(dirname $dir) || folder=${dir%%.git}
+        cd $OMD_ROOT
+        
+        echo '-----------------------------------------------------------------------------------------'
+        echo -e "$G_ARROW ${type}: ${folder}..." 
+        
+        reposdiff=$(git diff origin/master origin/homologacao --name-status)
+        if [ ! -z "$reposdiff" ]; then
+            answer_commit='s'
+            answer_check='s'
+
+            echo -e "$reposdiff\n"
+           
+            if [ $VERIFY = true ]; then
+                if [ ! $NOCONFIRM ]; then
+                    echo -en "$Y_ARROW Encontradas mudanças entre o repositório de homologação e produção. Verificá-las agora? [s/n]: "
+                    read answer_check
+                fi
+                [[ "$answer_check" =~ [sS] ]] && git diff origin/master origin/homologacao
+            fi
+            
+            if [ ! $NOCONFIRM ]; then
+                echo -en "$G_ARROW Efetuar commit no repositório de produção? [s/n]: "
+                read answer_commit
+            fi
+        else
+            echo -en "$G_ARROW Nenhuma alteração encontrada nos repositórios...\n"
+        fi
+
+        [[ "$answer_commit" =~ [sS] ]] && (git push origin master; echo) || echo -e "$G_ARROW Nada a ser feito!\n"
+    done
+}
+
+_shift='[[ -n "$2" && ! "$2" =~ ^- ]] && shift'
+
+srv_manage() {
+    if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+        for srv in $2; do
+            omd $1 $srv
+        done
+    else
+        echo -e "$R_ARROW ERRO: necessário informar o(s) nome(s) do(s) servico(s)"
+    fi
+}
+
+check_params() {
+    for item in $@; do 
+        [[ $item =~ ^- ]] && break || values="$values $item"
+    done
+
+    echo $values
+}
+
+[ $# -eq 0 ] && help
+
+while [ $1 ]
+do
+    case $1 in
+        '-v') 
+            VERIFY=true ;;
+        '-y'|'--noconfirm')
+            NOCONFIRM=true ;;
+        '-p'|'--prod')
+            ssh -t root@marea "su - nagios -c 'seges-deploy ${@:2}'"; rm -rf $PID; exit ;;
+        '-c'|'--check')
+            check_changes "$2"
+            eval $_shift ;;
+        '-d'|'--deploy')
+            deploy "$2"
+            eval $_shift ;;
+        '-m'|'--message')
+            DEPLOY_MESSAGE="$2" 
+            shift ;;
+        '-u'|'--update')
+            update "$2" 
+            eval $_shift ;;
+        '-O')
+            cmk -O ;;
+        '-I'|'--inventory')
+            _hosts=$(check_params ${@:2})
+            cmk -Iv $_hosts
+            if [ "${HOSTNAME%%.*}" != 'focus' ]; then
+                echo -e "\n${GREEN}>>> Conectando-se ao servidor de homologação....${RESET}"
+                ssh -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' root@focus "su - nagios -c 'cmk -Iv $_hosts'"
+            fi
+            echo && eval $_shift ;;
+        '-II'|'--reinventory')
+            _hosts=$(check_params ${@:2})
+            for item in ${@:2}; do [[ $item =~ ^- ]] && break || _hosts="$_hosts $item"; done
+            cmk -IIv $_hosts
+            if [ "${HOSTNAME%%.*}" != 'focus' ]; then
+                echo -e "\n${GREEN}>>> Conectando-se ao servidor de homologação....${RESET}"
+                ssh -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' root@focus "su - nagios -c 'cmk -IIv $_hosts'"
+            fi 
+            echo && eval $_shift ;;
+        '--start')
+            srv_manage start "$2"
+            echo && shift ;;
+        '--stop')
+            srv_manage stop "$2"
+            echo && shift ;;
+        '--restart')
+            srv_manage restart "$2"
+            echo && shift ;;
+        '--reload')
+            srv_manage reload "$2"
+            echo && shift ;;
+        '-h'|'--help' | ?) help ;;                   
+    esac
+    shift
+done
+
+rm -f $PID
