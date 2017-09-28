@@ -39,15 +39,18 @@ echo -e "$RESET"
 
 APPNAME=$(basename $0)
 PID="/tmp/${APPNAME}.pid"
+PIDCHECK='ps -ef | grep -c $(<$PID) 2> /dev/null'
 DATE=$(date +"%Y%m%d-%H:%M")
 GITDIRS="$(find ~ -name '.git' | grep -v '.*etc/check_mk/.git')"
 VERIFY=false
 
-# Vericação por outra execução do script em andamento
-if [ -f $PID ]; then
-    echo -en "${R_ARROW} O script $0 está em execução [ PID = $(cat $PID) ].\n${Y_ARROW} Aguardando finalização..." 
+[ "$OMD_ROOT" ] && ROOT=$OMD_ROOT || ROOT=$PWD
 
-    while [ -f $PID ]
+# Vericação por outra execução do script em andamento
+if [[ -f $PID && $(eval $PIDCHECK) -gt 1 ]]; then
+    echo -en "${R_ARROW} O script $0 está em execução [ PID = $(<$PID) ].\n${Y_ARROW} Aguardando finalização..." 
+
+    while [[ -f $PID ]]
     do
         echo -n "..." && sleep 2 && continue
     done
@@ -58,7 +61,7 @@ fi
 ### Checando se o script já está executando ###
 trap "echo -e $RESET; rm -f $PID; exit" 1 2 3 9 15
 
-[[ ! -f $PID || -z $(cat $PID) ]] && echo $$ > $PID 
+[[ ! -f $PID || $(eval $PIDCHECK) -eq 1 ]] && echo $$ > $PID 
 
 # Função de ajuda de utilização do script
 function help() {
@@ -83,9 +86,9 @@ OPTIONS:
     --reload [SERVICE]\t\t Recarrega as configurações do Nagios/Check_MK
 
 EXAMPLES:
-    $APPNAME -v -d ~/etc/check_mk\t(ou somente seges-deploy -d)
-    $APPNAME -y -m 'Mensagem de Commit' -d "etc/check_mk/conf.d/services.mk local/bin/seges-deploy"
-    $APPNAME -u ~/etc/nagios\t(ou somente seges-deploy -u)
+    $APPNAME -v -d etc/check_mk\t(ou somente seges-deploy -d)
+    $APPNAME -y -m 'Mensagem de Commit' -d 'etc/check_mk/conf.d/services.mk local/bin/seges-deploy'
+    $APPNAME -u etc/nagios\t(ou somente seges-deploy -u)
     $APPNAME --restart 'nagios apache'\t(ou somente seges-deploy --restart)
     $APPNAME -p -II MAREA FOCUS SONIC -O
     $APPNAME -p -u
@@ -100,33 +103,34 @@ function check_changes() {
     # Se o arquivo não tiver sido alterado nos últimos 2 dias, o comando para atualizá-lo será executado
     if [ $(( ($(date +%s) - $(stat -c %Y ~/etc/check_mk/conf.d/parents.mk)) / 86400 )) -gt 2 ]; then 
         echo -e "${GREEN[0]}>>> Atualizando parents.mk...$RESET" 
-        $OMD_ROOT/local/bin/cmkparents
+        $ROOT/local/bin/cmkparents
     fi
 
     echo -e "${YELLOW[0]}>>> Checando alterações nos diretórios versionados...$RESET" 
     
-    for dir in $_gitdirs
+    for _dir in $_gitdirs
     do
         unset answer_add answer_check answer_commit message 
+        cd $ROOT
 
-        folder=${dir%%.git}
+        _dir=${_dir%%.git}
 
-        [[ $folder =~ ^\~ ]] && folder=${folder/\~/$OMD_ROOT}
+        [[ $_dir =~ ^\~ ]] && _dir=${_dir/\~/$ROOT}
 
-        if [ -d $folder ]; then
-            cd $folder
+        if [ -d $_dir ]; then
+            cd $_dir
             type='Diretório'
             _file='.'
         else
-            cd $(dirname $folder)
+            cd $(dirname $_dir)
             type='Arquivo'
-            _file=$(basename $folder)
+            _file=$(basename $_dir)
         fi
         
-        export folder
+        export _dir
 
         echo '-----------------------------------------------------------------------------------------'
-        echo -e "$G_ARROW ${type}: ${folder}..." 
+        echo -e "$G_ARROW ${type}: ${_dir}..." 
 
         status=$(git status -s $_file 2> /dev/null)
         if [ $? -eq 0 ]; then
@@ -184,42 +188,39 @@ function check_changes() {
     done
 }
 
+
 function update() {
     [[ -n "$1" && ! "$1" =~ ^- ]] && _gitdirs="$@" || _gitdirs="$GITDIRS"
         
     echo -e "${YELLOW[0]}>>> Atualizando diretórios versionados...$RESET"
 
-    for dir in $_gitdirs
+    for _dir in $_gitdirs
     do
-        folder=${dir%%.git}
-        
-        [[ $folder =~ ^\~ ]] && folder=${folder/\~/$OMD_ROOT}
-        
-        cd $folder
+        _dir=${_dir%%.git}
+        cd $_dir
         
         echo '-------------------------------------------------------------------'
-        echo -e "$G_ARROW Diretório: ${folder}..." 
+        echo -e "$G_ARROW Diretório: ${_dir}..." 
         [ "${HOSTNAME%%.*}" == 'marea' ] && git checkout -- .
         git pull
+        echo
+        cd $ROOT
     done
 }
 
-
 # Função que efetua o deploy das alterações no ambiente
 function deploy() {
-    [[ -n "$1" && ! "$1" =~ ^- ]] && _gitdir="$@" || _gitdir="$(find ~ -name '.git' | grep -v '.*etc/check_mk/.git')"
-    
     # Checagem por alterações nos diretórios versionados
-    check_changes "$_gitdir"
+    check_changes "$@"
 
     echo -e "\n${YELLOW[0]}>>> Verficando diferenças entre o repositório de produção e homologacao...$RESET" 
 
-    for dir in $folder
+    for folder in $_dir
     do
         unset answer_check answer_commit
 
-        [ -f $dir ] && folder=$(dirname $dir) || folder=${dir%%.git}
-        cd $OMD_ROOT
+        [ -f $dir ] && folder=$(dirname $folder) || folder=${folder%%.git}
+        cd $ROOT
         
         echo '-----------------------------------------------------------------------------------------'
         echo -e "$G_ARROW ${type}: ${folder}..." 
@@ -250,6 +251,7 @@ function deploy() {
         [[ "$answer_commit" =~ [sS] ]] && (git push origin master; echo) || echo -e "$G_ARROW Nada a ser feito!\n"
     done
 }
+
 
 _shift='[[ -n "$2" && ! "$2" =~ ^- ]] && shift'
 
@@ -299,18 +301,17 @@ do
         '-I'|'--inventory')
             _hosts=$(check_params ${@:2})
             cmk -Iv $_hosts
-            if [ "${HOSTNAME%%.*}" != 'focus' ]; then
+            if [ "${HOSTNAME%%.*}" == 'marea' ]; then
                 echo -e "\n${GREEN}>>> Conectando-se ao servidor de homologação....${RESET}"
-                ssh -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' root@focus "su - nagios -c 'cmk -Iv $_hosts'"
+                ssh -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' root@focus "su - nagios -c 'cmk -Iv $_hosts; cmk -O'"
             fi
             echo && eval $_shift ;;
         '-II'|'--reinventory')
             _hosts=$(check_params ${@:2})
-            for item in ${@:2}; do [[ $item =~ ^- ]] && break || _hosts="$_hosts $item"; done
             cmk -IIv $_hosts
-            if [ "${HOSTNAME%%.*}" != 'focus' ]; then
+            if [ "${HOSTNAME%%.*}" == 'marea' ]; then
                 echo -e "\n${GREEN}>>> Conectando-se ao servidor de homologação....${RESET}"
-                ssh -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' root@focus "su - nagios -c 'cmk -IIv $_hosts'"
+                ssh -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' root@focus "su - nagios -c 'cmk -IIv $_hosts; cmk -O'"
             fi 
             echo && eval $_shift ;;
         '--start')
